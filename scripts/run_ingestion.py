@@ -3,7 +3,10 @@
 מריץ את שכבת הקליטה של סוכן א' על כל תיקיות הנבדקים:
 פורס את קבצי ה-ZIP, מתמלל את הסריקות, מדרג קריאוּת, ומפיק תגיות.
 
-הוראות הרצה מלאות: קובץ הוראות_הרצה.md באותה תיקייה.
+הרצה:  python הרץ_קליטה.py
+
+הסקריפט בודק את המפתח לפני שהוא מתחיל, ומדלג על תיקים שכבר נקלטו —
+אפשר לעצור באמצע ולהריץ שוב בלי לשלם פעמיים.
 """
 
 import asyncio
@@ -13,31 +16,97 @@ import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).parent
-REPO = HERE / "huris-agents"       # ניתן לשנות אם שמת את הקוד במקום אחר
+REPO = HERE / "huris-agents"
 OUT = HERE / "_תוצאות"
 WORK = HERE / "_extracted"
 
 MODEL = "claude-sonnet-5"
+KEY_PREFIX = "sk-ant-"
+
+
+def say(text: str) -> None:
+    """הדפסה שלא קורסת על מסוף שלא תומך בעברית."""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(text.encode("ascii", "replace").decode())
 
 
 def load_key() -> str:
-    """קורא את המפתח מקובץ .env, או ממשתנה סביבה."""
+    """קורא את המפתח מקובץ .env ובודק שהוא סביר לפני שמנסים להשתמש בו."""
     env = HERE / ".env"
-    if env.exists():
-        for line in env.read_text(encoding="utf-8").splitlines():
-            if line.startswith("ANTHROPIC_API_KEY="):
-                return line.split("=", 1)[1].strip()
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
+
+    if not env.exists():
+        sys.exit(
+            f"\nלא נמצא קובץ .env בתיקייה:\n  {HERE}\n\n"
+            "צריך קובץ בשם .env ובתוכו שורה אחת:\n"
+            "  ANTHROPIC_API_KEY=sk-ant-api03-...\n"
+        )
+
+    key = ""
+    for line in env.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip().lstrip("﻿")
+        if line.startswith("ANTHROPIC_API_KEY"):
+            key = line.split("=", 1)[1].strip() if "=" in line else ""
+            break
+
+    # ציטוט או רווח נסתר הם הסיבה השכיחה ל"מפתח לא תקף"
+    key = key.strip().strip('"').strip("'").strip()
+
     if not key:
         sys.exit(
-            "לא נמצא מפתח.\n"
-            f"צרי קובץ בשם .env בתיקייה {HERE}\n"
-            "ובתוכו שורה אחת:  ANTHROPIC_API_KEY=sk-ant-..."
+            "\nהקובץ .env קיים אבל אין בו מפתח.\n"
+            "השורה צריכה להיראות בדיוק כך, בלי גרשיים ובלי רווחים:\n"
+            "  ANTHROPIC_API_KEY=sk-ant-api03-...\n"
         )
+
+    if not key.startswith(KEY_PREFIX):
+        sys.exit(
+            f"\nהמפתח לא מתחיל ב-{KEY_PREFIX}\n"
+            f"מה שנמצא מתחיל ב: {key[:12]}...\n"
+            "כנראה הועתק משהו אחר, או שנשארה מילה מיותרת בשורה.\n"
+        )
+
+    if len(key) < 90:
+        sys.exit(
+            f"\nהמפתח קצר מדי ({len(key)} תווים; מצופה כ-100 ומעלה).\n"
+            "כנראה ההעתקה נחתכה. השתמשי בכפתור ההעתקה שליד המפתח,\n"
+            "ולא בסימון ידני עם העכבר.\n"
+        )
+
+    say(f"מפתח נטען: {key[:14]}...{key[-4:]}  ({len(key)} תווים)")
     return key
 
 
-def unpack() -> list[Path]:
+async def verify_key(client) -> None:
+    """בדיקה זולה אחת לפני שמעבדים 85 עמודים."""
+    say("בודק את המפתח מול Anthropic...")
+    try:
+        await client.messages.create(
+            model=MODEL,
+            max_tokens=4,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+    except Exception as exc:
+        text = str(exc)
+        if "authentication" in text or "401" in text:
+            sys.exit(
+                "\nהמפתח נדחה על ידי Anthropic.\n\n"
+                "שלוש סיבות אפשריות:\n"
+                "  1. המפתח נמחק או הועתק חלקית — צרי חדש ב-console.anthropic.com\n"
+                "  2. המפתח שייך לחשבון אחר\n"
+                "  3. ההרשמה ל-Console לא הושלמה\n"
+            )
+        if "credit" in text.lower() or "billing" in text.lower():
+            sys.exit(
+                "\nאין יתרה בחשבון.\n"
+                "היכנסי ל-console.anthropic.com → Billing → הוסיפי קרדיט.\n"
+            )
+        sys.exit(f"\nשגיאה בפנייה ל-Anthropic:\n{text}\n")
+    say("המפתח תקין.\n")
+
+
+def unpack() -> list:
     """פורס את קבצי ה-ZIP של כל נבדק. מדלג על מה שכבר נפרס."""
     WORK.mkdir(exist_ok=True)
     cases = []
@@ -52,7 +121,7 @@ def unpack() -> list[Path]:
                     with zipfile.ZipFile(archive) as zf:
                         zf.extractall(target)
                 except zipfile.BadZipFile:
-                    print(f"  ! לא ניתן לפרוס: {archive.name}")
+                    say(f"  ! לא ניתן לפרוס: {archive.name}")
         if any(target.iterdir()):
             cases.append(target)
     return cases
@@ -62,42 +131,51 @@ async def run() -> None:
     sys.path.insert(0, str(REPO))
     try:
         from agents.agent_1 import Ingestor, build_payload, explain, inventory
-        from agents.shared import AgentAToBPayload
-    except ImportError:
+    except ImportError as exc:
         sys.exit(
-            f"לא נמצא קוד הפרויקט ב-{REPO}\n"
-            "הורידי אותו מ-github.com/MayaHertzanu-creator/Huris-pilot\n"
-            "ושימי את תיקיית huris-agents כאן."
+            f"\nלא נמצא קוד הפרויקט ב:\n  {REPO}\n\n"
+            f"פרטים: {exc}\n"
         )
 
     try:
         from anthropic import AsyncAnthropic
     except ImportError:
-        sys.exit("חסרות ספריות. הריצי:  pip install anthropic pdfplumber pypdfium2 pydantic")
+        sys.exit(
+            "\nחסרות ספריות. הריצי:\n"
+            "  pip install anthropic pdfplumber pypdfium2 pydantic\n"
+        )
 
     client = AsyncAnthropic(api_key=load_key())
-    OUT.mkdir(exist_ok=True)
+    await verify_key(client)
 
+    OUT.mkdir(exist_ok=True)
     cases = unpack()
     if not cases:
         sys.exit("לא נמצאו תיקי נבדקים.")
 
-    print(f"נמצאו {len(cases)} תיקים.\n")
+    pending = [c for c in cases if not (OUT / f"{c.name} — תמלול.md").exists()]
+    done = len(cases) - len(pending)
+    if done:
+        say(f"{done} תיקים כבר נקלטו — מדלג עליהם.")
+    if not pending:
+        say(f"\nהכול כבר נקלט. התוצאות ב:\n  {OUT}")
+        return
+
+    say(f"נותרו {len(pending)} תיקים לעיבוד.\n")
     ingestor = Ingestor(client=client, model=MODEL, work_dir=WORK / "_render")
 
-    for case in cases:
-        print(f"── {case.name}")
+    for case in pending:
+        say(f"── {case.name}")
         try:
             sources = await ingestor.ingest_folder(case)
         except Exception as exc:
-            print(f"   שגיאה: {exc}\n")
+            say(f"   שגיאה: {exc}\n")
             continue
 
         for src in sources:
-            mark = "✓" if src.usable else "✗"
-            print(f"   {mark} {src.name}  [{src.source_type}]  קריאוּת: {src.legibility.value}")
+            mark = "V" if src.usable else "X"
+            say(f"   {mark} {src.name}  [{src.source_type}]  קריאוּת: {src.legibility.value}")
 
-        # התמלול המלא — זה מה שסוכן ג' יקבל
         lines = [f"# {case.name} — תמלול\n"]
         lines.append(f"סוגי מקורות: {', '.join(inventory(sources))}\n")
         for src in sources:
@@ -106,22 +184,18 @@ async def run() -> None:
             lines.append(src.text if src.text else "_לא ניתן היה לקרוא_")
         (OUT / f"{case.name} — תמלול.md").write_text("\n".join(lines), encoding="utf-8")
 
-        # תגיות: דורשות שכבת החילוץ, שאינה חלק מהקליטה
-        usable = [s for s in sources if s.usable]
-        if usable:
+        if any(s.usable for s in sources):
             payload = build_payload(case.name, [], sources)
-            tag_lines = [f"# {case.name} — תגיות\n"]
-            tag_lines.append("> הופק ללא שכבת חילוץ הסימנים — כל התגיות שליליות.")
-            tag_lines.append("> משמש לאימות הצינור בלבד.\n")
+            tags = [f"# {case.name} — תגיות\n"]
+            tags.append("> הופק ללא שכבת חילוץ הסימנים — כל התגיות שליליות.")
+            tags.append("> משמש לאימות הצינור בלבד.\n")
             for tag in payload.tags:
-                tag_lines.append(explain(tag) + "\n")
-            tag_lines.append("\n" + payload.coverage_summary().audit_line())
-            (OUT / f"{case.name} — תגיות.md").write_text(
-                "\n".join(tag_lines), encoding="utf-8"
-            )
-        print()
+                tags.append(explain(tag) + "\n")
+            tags.append("\n" + payload.coverage_summary().audit_line())
+            (OUT / f"{case.name} — תגיות.md").write_text("\n".join(tags), encoding="utf-8")
+        say("")
 
-    print(f"הסתיים. התוצאות ב: {OUT}")
+    say(f"הסתיים. התוצאות ב:\n  {OUT}")
 
 
 if __name__ == "__main__":
