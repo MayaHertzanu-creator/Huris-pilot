@@ -106,6 +106,59 @@ async def verify_key(client) -> None:
     say("המפתח תקין.\n")
 
 
+def open_in_editor(path: Path) -> bool:
+    """פותח קובץ בתוכנה שמוגדרת אצל המשתמש.
+
+    התמלול הוא עברית ארוכה, והמסוף של Windows לא מציג אותה כראוי. פתיחה
+    בחלון נפרד היא הדרך היחידה שבה אפשר באמת לקרוא את מה שיצא.
+    """
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            import subprocess
+            subprocess.run(["open", str(path)], check=False)
+        else:
+            import subprocess
+            subprocess.run(["xdg-open", str(path)], check=False)
+        return True
+    except Exception:
+        return False
+
+
+def summarise(sources) -> None:
+    """מדפיס סטטיסטיקה קצרה שאפשר לקרוא גם במסוף שלא תומך בעברית."""
+    from agents.agent_1.ingestion import UNREADABLE
+
+    total_gaps = sum(s.text.count(UNREADABLE) for s in sources)
+    usable = sum(1 for s in sources if s.usable)
+    say(f"   מקורות: {usable}/{len(sources)} שמישים · סימוני [לא קריא]: {total_gaps}")
+    if total_gaps == 0 and usable:
+        say("   שים לב: אפס פערים. כדאי לוודא מול המקור שלא הושלם טקסט.")
+
+
+def ask_continue(case_name: str, remaining: int) -> str:
+    """עצירה לאישור בין נבדקים.
+
+    מחזיר: continue / all / stop.
+    עצירה אינה מאבדת דבר — מה שנקלט כבר נשמר, והרצה חוזרת מדלגת עליו.
+    """
+    if remaining == 0:
+        return "stop"
+    say("")
+    say(f"   סיימתי את {case_name}. נותרו {remaining}.")
+    say("   [Enter] להמשיך · [a] להריץ הכל בלי לשאול · [n] לעצור")
+    try:
+        answer = input("   > ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return "stop"
+    if answer.startswith("n"):
+        return "stop"
+    if answer.startswith("a"):
+        return "all"
+    return "continue"
+
+
 def unpack() -> list:
     """פורס את קבצי ה-ZIP של כל נבדק. מדלג על מה שכבר נפרס."""
     WORK.mkdir(exist_ok=True)
@@ -161,10 +214,14 @@ async def run() -> None:
         say(f"\nהכול כבר נקלט. התוצאות ב:\n  {OUT}")
         return
 
-    say(f"נותרו {len(pending)} תיקים לעיבוד.\n")
+    say(f"נותרו {len(pending)} תיקים לעיבוד.")
+    say("אחרי כל נבדק ייפתח התמלול לבדיקה, ותישאלי אם להמשיך.")
+    say("(להרצה רצופה בלי עצירות: python הרץ_קליטה.py --all)\n")
+
+    ask = "--all" not in sys.argv
     ingestor = Ingestor(client=client, model=MODEL, work_dir=WORK / "_render")
 
-    for case in pending:
+    for index, case in enumerate(pending):
         say(f"── {case.name}")
         try:
             sources = await ingestor.ingest_folder(case)
@@ -176,13 +233,20 @@ async def run() -> None:
             mark = "V" if src.usable else "X"
             say(f"   {mark} {src.name}  [{src.source_type}]  קריאוּת: {src.legibility.value}")
 
+        summarise(sources)
+
         lines = [f"# {case.name} — תמלול\n"]
         lines.append(f"סוגי מקורות: {', '.join(inventory(sources))}\n")
+        lines.append(
+            "> בדקי מול הסריקה המקורית: האם משהו **הומצא**? "
+            "פער מסומן ב-[לא קריא] הוא תקין; טקסט סביר שלא כתוב במקור הוא כשל.\n"
+        )
         for src in sources:
             lines.append(f"\n## {src.name}")
             lines.append(f"*סוג: {src.source_type} · קריאוּת: {src.legibility.value}*\n")
             lines.append(src.text if src.text else "_לא ניתן היה לקרוא_")
-        (OUT / f"{case.name} — תמלול.md").write_text("\n".join(lines), encoding="utf-8")
+        transcript = OUT / f"{case.name} — תמלול.md"
+        transcript.write_text("\n".join(lines), encoding="utf-8")
 
         if any(s.usable for s in sources):
             payload = build_payload(case.name, [], sources)
@@ -193,6 +257,18 @@ async def run() -> None:
                 tags.append(explain(tag) + "\n")
             tags.append("\n" + payload.coverage_summary().audit_line())
             (OUT / f"{case.name} — תגיות.md").write_text("\n".join(tags), encoding="utf-8")
+
+        if ask:
+            if not open_in_editor(transcript):
+                say(f"   (לא הצלחתי לפתוח אוטומטית. הקובץ: {transcript})")
+            choice = ask_continue(case.name, len(pending) - index - 1)
+            if choice == "stop":
+                say(f"\nנעצר לבקשתך. {index + 1} תיקים הושלמו ונשמרו.")
+                say("הרצה חוזרת תמשיך מהנקודה הזו בלי לחייב שוב.")
+                return
+            if choice == "all":
+                ask = False
+                say("   ממשיך ברצף עד הסוף.")
         say("")
 
     say(f"הסתיים. התוצאות ב:\n  {OUT}")
