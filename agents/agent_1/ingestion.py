@@ -51,11 +51,13 @@ MODEL = "claude-sonnet-5"
 # the most content.
 MAX_TRANSCRIPTION_TOKENS = 16000
 
-# Sampling was left at its default, and it showed: two runs over one report
-# cleared different pages, so the evidence reaching the assessment changed
-# while the document did not. A reading layer feeding a decision that must be
-# defensible later cannot be a fresh roll each time.
-TRANSCRIPTION_TEMPERATURE = 0
+# Two runs over one report cleared different pages, so the evidence reaching
+# the assessment changed while the document did not. Pinning temperature was
+# the obvious remedy and the model does not accept it, so the variance has to
+# be worked with instead of removed: a page that fails is attempted again,
+# and the best attempt is kept and cached. Repeated reading converges upward
+# rather than rerolling, which is what makes a re-run safe.
+TRANSCRIPTION_ATTEMPTS = 3
 
 
 class IngestionError(Exception):
@@ -427,17 +429,33 @@ class Ingestor:
                 "a scanned source needs a vision client; pass one to Ingestor"
             )
 
-        import base64
+        number = int(image_path.stem.rsplit("_p", 1)[-1])
+        best = load_cached_page(image_path)
 
-        cached = load_cached_page(image_path)
-        if cached is not None:
-            return cached
+        # A cached page that read cleanly is final. One that failed is worth
+        # another look, since the same scan can read differently on a second
+        # attempt -- that variance is the whole reason for retrying.
+        if best is not None and best.legibility is not Legibility.LOW:
+            return best
+
+        for _ in range(TRANSCRIPTION_ATTEMPTS):
+            attempt = await self._transcribe_once(image_path, number)
+            if best is None or attempt.readable_ratio > best.readable_ratio:
+                best = attempt
+                save_cached_page(image_path, best)
+            if best.legibility is not Legibility.LOW:
+                break
+
+        return best or PageText(number, "", 0.0, "לא התקבלה תשובה")
+
+    async def _transcribe_once(self, image_path: Path, number: int) -> PageText:
+        """One attempt at one page."""
+        import base64
 
         data = base64.standard_b64encode(image_path.read_bytes()).decode()
         response = await self.client.messages.create(
             model=self.model,
             max_tokens=MAX_TRANSCRIPTION_TOKENS,
-            temperature=TRANSCRIPTION_TEMPERATURE,
             messages=[
                 {
                     "role": "user",
@@ -455,7 +473,6 @@ class Ingestor:
                 }
             ],
         )
-        number = int(image_path.stem.rsplit("_p", 1)[-1])
         raw = response_text(response)
         truncated = getattr(response, "stop_reason", None) == "max_tokens"
 
@@ -476,9 +493,7 @@ class Ingestor:
                 f"העמוד צפוף מדי, לא בלתי-קריא"
                 + (f" · {notes}" if notes else "")
             )
-        page = PageText(number=number, text=text, readable_ratio=ratio, notes=notes)
-        save_cached_page(image_path, page)
-        return page
+        return PageText(number=number, text=text, readable_ratio=ratio, notes=notes)
 
     async def ingest_file(self, path: Path, name: Optional[str] = None) -> List[SourceDocument]:
         """Read one file into one or more SourceDocuments.
