@@ -51,6 +51,12 @@ MODEL = "claude-sonnet-5"
 # the most content.
 MAX_TRANSCRIPTION_TOKENS = 16000
 
+# Sampling was left at its default, and it showed: two runs over one report
+# cleared different pages, so the evidence reaching the assessment changed
+# while the document did not. A reading layer feeding a decision that must be
+# defensible later cannot be a fresh roll each time.
+TRANSCRIPTION_TEMPERATURE = 0
+
 
 class IngestionError(Exception):
     """Raised only for conditions the caller must act on, never for bad input.
@@ -171,9 +177,20 @@ TRANSCRIPTION_PROMPT = f"""אתה מתמלל עמוד סרוק מתוך תיק �
 5. שמור על מבנה: כותרות, סעיפים ממוספרים, טבלאות.
 6. אל תוסיף הערות משלך לתוך התמלול.
 
+## שחזור מהקשר — אסור
+מילה שלא ראית בבירור אינה מילה שקראת, גם אם ברור מה היא אמורה להיות.
+המסמך הזה משמש להערכת אדם, ומילה ששוחזרה נראית בהמשך הדרך זהה למילה
+שנקראה — אין דרך להבדיל ביניהן בשלב מאוחר יותר.
+
+אם אתה מוצא את עצמך כותב "שוחזר מהקשר", "ניחוש הקשרי" או "ייתכן שיש
+טעות" — עצור וכתוב {UNREADABLE} במקום. זו התשובה הנכונה, לא כישלון.
+
 ## הערכת קריאוּת
-בסוף, דווח איזה חלק מהעמוד הצלחת לקרוא בביטחון — מספר בין 0 ל-1.
-היה שמרן: אם אתה מתלבט בין שני ערכים, בחר את הנמוך.
+דווח איזה חלק מהעמוד **קראת בפועל**, בין 0 ל-1.
+אל תספור בתוך זה מילים ששיערת. טקסט משוחזר מוריד את המספר, לא מעלה אותו.
+פרטים מושחרים אינם פוגעים בקריאוּת — הם הוסתרו בכוונה וסימונם הוא קריאה
+נכונה של העמוד.
+במקרה של התלבטות בין שני ערכים — בחר את הנמוך.
 
 ## פורמט הפלט
 JSON בלבד:
@@ -314,6 +331,56 @@ def infer_source_type(name: str) -> str:
     return classify_source("", name)
 
 
+def _cache_path(image_path: Path) -> Path:
+    return image_path.with_suffix(".transcript.json")
+
+
+def load_cached_page(image_path: Path) -> Optional[PageText]:
+    """Return a page transcribed on an earlier run, if there is one.
+
+    Transcription of the same scan is not repeatable in practice: on two runs
+    of one six-page report, different pages cleared the legibility threshold,
+    so the evidence reaching the assessment changed while the input did not.
+    Caching makes a re-run additive -- a page read once stays read -- instead
+    of a fresh roll that can lose what the last run recovered.
+
+    Delete the .transcript.json files to force a clean re-read.
+    """
+    path = _cache_path(image_path)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return PageText(
+            number=int(data["number"]),
+            text=data.get("text", ""),
+            readable_ratio=float(data.get("readable_ratio", 0.0)),
+            notes=data.get("notes", ""),
+        )
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None  # a damaged cache entry is simply re-read
+
+
+def save_cached_page(image_path: Path, page: PageText) -> None:
+    """Persist a page transcription beside its image."""
+    try:
+        _cache_path(image_path).write_text(
+            json.dumps(
+                {
+                    "number": page.number,
+                    "text": page.text,
+                    "readable_ratio": page.readable_ratio,
+                    "notes": page.notes,
+                },
+                ensure_ascii=False,
+                indent=1,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass  # caching is an optimisation; failing to cache is not an error
+
+
 def describe_failures(failed: Sequence[PageText], total: int) -> str:
     """Say why each page failed, not merely that it did.
 
@@ -362,10 +429,15 @@ class Ingestor:
 
         import base64
 
+        cached = load_cached_page(image_path)
+        if cached is not None:
+            return cached
+
         data = base64.standard_b64encode(image_path.read_bytes()).decode()
         response = await self.client.messages.create(
             model=self.model,
             max_tokens=MAX_TRANSCRIPTION_TOKENS,
+            temperature=TRANSCRIPTION_TEMPERATURE,
             messages=[
                 {
                     "role": "user",
@@ -404,7 +476,9 @@ class Ingestor:
                 f"העמוד צפוף מדי, לא בלתי-קריא"
                 + (f" · {notes}" if notes else "")
             )
-        return PageText(number=number, text=text, readable_ratio=ratio, notes=notes)
+        page = PageText(number=number, text=text, readable_ratio=ratio, notes=notes)
+        save_cached_page(image_path, page)
+        return page
 
     async def ingest_file(self, path: Path, name: Optional[str] = None) -> List[SourceDocument]:
         """Read one file into one or more SourceDocuments.
