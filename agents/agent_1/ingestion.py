@@ -255,25 +255,71 @@ def assemble_text(pages: Sequence[PageText]) -> str:
     return "\n\n".join(parts)
 
 
-def infer_source_type(name: str) -> str:
-    """Guess the document type from its name, defaulting to other.
+# Phrases that identify a document type. Chosen to be structural -- headings
+# and field labels that belong to a form -- rather than topical, since topic
+# words like "סמים" appear in every document type in a reliability file.
+TYPE_SIGNALS = {
+    "cv": (
+        "קורות חיים", "ניסיון תעסוקתי", "השכלה", "curriculum", "resume",
+    ),
+    "screening_test": (
+        "integritymeter", "integrity meter", "מבדק אמינות ממוחשב",
+        "שאלון", "אחוזון", "ציון גולמי", "סולם", "פרופיל",
+    ),
+    "recruitment_interview": (
+        "שם המתשאל", "שם המראיין", "סיכום והמלצה", "אופן זיהוי הנבדק",
+        "כרונולוגיה תעסוקתית", "טופס ראיון", "תאריך ראיון",
+    ),
+    "occupational_psych_opinion": (
+        "חוות דעת", "חוו\"ד", "פסיכולוג", "הערכה תעסוקתית", "אדם מילא",
+    ),
+}
 
-    IngestionSpec 6 is explicit that a doubtful case takes 'other' with a
-    descriptive name rather than a forced category, so a mislabelled document
-    does not mislead Agent C about what kind of evidence it is holding.
+
+def classify_source(text: str, name: str = "") -> str:
+    """Decide what kind of document this is, from its content.
+
+    Naming was the obvious first approach and it failed completely on the
+    real cases: the files arrive as file_1, file_2, file_3, so every source
+    classified as 'other' and the source-diversity signal that D-9 and
+    INTERFACES 4c depend on was silently empty.
+
+    Signals are counted rather than matched first-wins, because these
+    documents quote each other -- an interview summary reports the score of
+    a screening test, so a single keyword decides nothing. The type with the
+    most distinct hits wins, and a tie or a blank falls to 'other', which
+    IngestionSpec 6 prefers to a forced category.
     """
-    lowered = name.lower()
-    table = {
-        "cv": ("cv", "resume", "קורות חיים", "קו\"ח"),
-        "screening_test": ("integrity", "מהימנות", "אמינות", "מבדק", "שאלון"),
-        "recruitment_interview": ("ראיון", "interview", "מיון"),
-        "occupational_psych_opinion": ("אדם מילא", "הערכה תעסוקתית", "חוו\"ד", "פסיכולוג"),
+    haystack = f"{text}\n{name}".lower()
+    scores = {
+        source_type: sum(1 for needle in needles if needle.lower() in haystack)
+        for source_type, needles in TYPE_SIGNALS.items()
     }
-    for source_type, needles in table.items():
-        if any(n.lower() in lowered for n in needles):
-            return source_type
-    return "other"
+    best = max(scores, key=lambda k: scores[k])
+    if scores[best] == 0:
+        return "other"
+    if sorted(scores.values())[-2:] == [scores[best], scores[best]]:
+        return "other"  # two types tied; naming it would be a guess
+    return best
 
+
+def infer_source_type(name: str) -> str:
+    """Classify from a filename alone, for sources with no readable text."""
+    return classify_source("", name)
+
+
+def unreadable_source(
+    label: str, origin_name: str, path: Path, note: str
+) -> SourceDocument:
+    """A source that could not be read, kept so the gap remains countable."""
+    return SourceDocument(
+        name=label,
+        legibility=Legibility.LOW,
+        source_type=infer_source_type(origin_name),
+        processed=False,
+        text="",
+        original_ref=f"{path} · {note}",
+    )
 
 class Ingestor:
     """Reads case files into SourceDocuments.
@@ -326,8 +372,14 @@ class Ingestor:
         text, ratio, notes = parse_transcription(raw)
         return PageText(number=number, text=text, readable_ratio=ratio, notes=notes)
 
-    async def ingest_file(self, path: Path, name: Optional[str] = None) -> SourceDocument:
-        """Read one file into a SourceDocument.
+    async def ingest_file(self, path: Path, name: Optional[str] = None) -> List[SourceDocument]:
+        """Read one file into one or more SourceDocuments.
+
+        Returns a list because a scan is often part legible and part not, and
+        the two halves cannot share a legibility grade. The readable pages
+        become a usable source; the rest become a recorded gap. Both are
+        returned, so nothing readable is lost and nothing unreadable is
+        passed off as evidence.
 
         Unreadable content never raises: it comes back as a low-legibility,
         unprocessed source, so the gap travels forward instead of vanishing.
@@ -339,20 +391,10 @@ class Ingestor:
         """
         path = Path(path)
         name = name or path.stem
+
         kind = detect_format(path)
-
-        def unreadable(note: str) -> SourceDocument:
-            return SourceDocument(
-                name=name,
-                legibility=Legibility.LOW,
-                source_type=infer_source_type(name),
-                processed=False,
-                text="",
-                original_ref=str(path),
-            )
-
         if kind in {"empty", "unsupported"}:
-            return unreadable(kind)
+            return [unreadable_source(name, name, path, kind)]
 
         if kind in {"scanned_image", "mixed", "image"} and self.client is None:
             raise IngestionError(
@@ -370,20 +412,50 @@ class Ingestor:
             rendered = render_pages(path, self.work_dir / name)
             pages = [await self._transcribe_page(img) for img in rendered]
 
-        text = assemble_text(pages)
-        legibility = grade_document(pages)
+        return self._split_by_legibility(pages, name, path)
 
-        if legibility is Legibility.LOW:
-            return unreadable("nothing usable extracted")
+    def _split_by_legibility(
+        self, pages: Sequence[PageText], name: str, path: Path
+    ) -> List[SourceDocument]:
+        """Separate the pages that were read from the pages that were not.
 
-        return SourceDocument(
-            name=name,
-            legibility=legibility,
-            source_type=infer_source_type(name),
-            processed=True,
-            text=text,
-            original_ref=str(path),
-        )
+        Grading a whole document by its worst page is right (IngestionSpec 2)
+        but discarding the document on that basis is not, and the first real
+        run showed the cost: a six-page screening report was dropped whole
+        over its blank pages, and the assessment lost the one document that
+        described the candidate's risk areas. Absent evidence and unread
+        evidence then look identical, which is the confusion this whole
+        layer exists to prevent.
+
+        So the grade still comes from the worst page, but only among pages
+        that carry text. Pages that failed are reported separately, by
+        number, so the gap stays countable.
+        """
+        readable = [p for p in pages if p.legibility is not Legibility.LOW]
+        failed = [p for p in pages if p.legibility is Legibility.LOW]
+
+        docs: List[SourceDocument] = []
+
+        if readable:
+            text = assemble_text(readable)
+            docs.append(
+                SourceDocument(
+                    name=name,
+                    legibility=grade_document(readable),
+                    source_type=classify_source(text, name),
+                    processed=True,
+                    text=text,
+                    original_ref=str(path),
+                )
+            )
+
+        if failed:
+            numbers = ", ".join(str(p.number) for p in failed)
+            label = f"{name} — עמודים שלא נקראו ({numbers})" if readable else name
+            note = f"עמודים {numbers} מתוך {len(pages)}"
+            docs.append(unreadable_source(label, name, path, note))
+
+        return docs or [unreadable_source(name, name, path, "no pages")]
 
     async def ingest_folder(self, folder: Path) -> List[SourceDocument]:
         """Read every file in a case folder, in a stable order.
@@ -395,8 +467,10 @@ class Ingestor:
         folder = Path(folder)
         docs: List[SourceDocument] = []
         for path in sorted(p for p in folder.iterdir() if p.is_file()):
-            docs.append(await self.ingest_file(path))
+            docs.extend(await self.ingest_file(path))
         return docs
+
+
 
 
 def inventory(sources: Sequence[SourceDocument]) -> List[str]:
