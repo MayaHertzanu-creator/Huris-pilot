@@ -1,132 +1,78 @@
-"""Base interfaces and abstract classes for HuriS agents."""
+"""Protocols the three agents implement.
 
-from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional
-from .schemas import CaseFile, Finding, Interview, Report
+Structural typing rather than inheritance: an agent satisfies these by having
+the right shape, so a test double or an offline replay of a stored case works
+without importing anything from the real implementations.
 
+The reading layers are async because they call a model over the network. The
+decision layers are not represented here at all -- they are plain functions,
+which is the point of RuleBook A D-1.
+"""
 
-class Agent(ABC):
-    """Base class for HuriS agents."""
+from typing import Protocol, Sequence, runtime_checkable
 
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.name = config.get("name", "unnamed_agent")
-        self.version = config.get("version", "0.1.0")
-
-    @abstractmethod
-    async def process(self, input_data: Any) -> Any:
-        """Process input and return output."""
-        pass
-
-    @abstractmethod
-    def validate_output(self, output: Any) -> bool:
-        """Validate agent output against schema."""
-        pass
+from .schemas import (
+    AgentAToCPayload,
+    AgentCOutput,
+    InterviewRecord,
+    Sign,
+    SourceDocument,
+)
 
 
-class DataStore(ABC):
-    """Abstract interface for persistent data storage."""
+@runtime_checkable
+class SignExtractor(Protocol):
+    """Agent A's reading layer: sources in, observed signs out.
 
-    @abstractmethod
-    async def save_case(self, case: CaseFile) -> str:
-        """Save case file and return case ID."""
-        pass
+    Reports what it saw and nothing more. It does not decide whether a tag is
+    True, and it does not weigh anything -- returning an empty list is a valid
+    and common result, not a failure.
+    """
 
-    @abstractmethod
-    async def load_case(self, case_id: str) -> Optional[CaseFile]:
-        """Load case file by ID."""
-        pass
-
-    @abstractmethod
-    async def update_case(self, case_id: str, updates: Dict[str, Any]) -> bool:
-        """Update case file."""
-        pass
-
-    @abstractmethod
-    async def list_cases(self, filter: Optional[Dict[str, Any]] = None) -> List[str]:
-        """List case IDs matching optional filter."""
-        pass
+    async def extract_signs(self, sources: Sequence[SourceDocument]) -> list[Sign]:
+        ...
 
 
-class ExtractorAgent(Agent):
-    """Interface for Agent 1: Data Extraction."""
+@runtime_checkable
+class Interviewer(Protocol):
+    """Agent B: conducts the interview and returns what was said.
 
-    @abstractmethod
-    async def extract_from_document(self, document_path: str, decision_spec: Dict) -> Dict[str, Any]:
-        """Extract structured data from document."""
-        pass
+    Receives seven booleans and no more (INTERFACES 2), so it cannot be
+    steered by Agent A's confidence.
+    """
 
-    @abstractmethod
-    async def validate_extraction(self, extracted: Dict, spec: Dict) -> List[str]:
-        """Validate extracted data against spec. Return list of errors or empty if valid."""
-        pass
-
-
-class InterviewAgent(Agent):
-    """Interface for Agent 2: Interview Conductor."""
-
-    @abstractmethod
-    async def start_interview(self, subject_id: str, protocol: Dict) -> str:
-        """Start interview and return interview_id."""
-        pass
-
-    @abstractmethod
-    async def ask_question(self, interview_id: str, question: str) -> Dict[str, Any]:
-        """Ask question and get response."""
-        pass
-
-    @abstractmethod
-    async def end_interview(self, interview_id: str, status: str) -> Interview:
-        """End interview and return structured Interview object."""
-        pass
-
-    @abstractmethod
-    async def check_safety(self, interview_id: str) -> bool:
-        """Check if interview should continue (safety check)."""
-        pass
+    async def conduct(
+        self, subject_id: str, tags: dict[str, bool]
+    ) -> InterviewRecord:
+        ...
 
 
-class AnalyzerAgent(Agent):
-    """Interface for Agent 3: Analysis & Reporting."""
+@runtime_checkable
+class Integrator(Protocol):
+    """Agent C: the only agent that sees both sides and may reach a verdict."""
 
-    @abstractmethod
-    async def analyze_findings(self, case_data: Dict[str, Any]) -> List[Finding]:
-        """Extract findings from case data."""
-        pass
-
-    @abstractmethod
-    async def apply_guardrails(self, findings: List[Finding]) -> List[str]:
-        """Apply safety guardrails. Return list of issues or empty if passed."""
-        pass
-
-    @abstractmethod
-    async def generate_report(self, findings: List[Finding], interview: Interview) -> Report:
-        """Generate final psychological report."""
-        pass
-
-
-class Orchestrator:
-    """Coordinates all three agents."""
-
-    def __init__(
+    async def assess(
         self,
-        agent_1: ExtractorAgent,
-        agent_2: InterviewAgent,
-        agent_3: AnalyzerAgent,
-        data_store: DataStore,
-    ):
-        self.agent_1 = agent_1
-        self.agent_2 = agent_2
-        self.agent_3 = agent_3
-        self.data_store = data_store
+        case: AgentAToCPayload,
+        interview: InterviewRecord | None = None,
+    ) -> AgentCOutput:
+        ...
 
-    @abstractmethod
-    async def process_case(
-        self,
-        case_id: str,
-        documents: List[str],
-        interview_protocol: Dict,
-        specs: Dict[str, Any],
-    ) -> CaseFile:
-        """Orchestrate full case processing through all three agents."""
-        pass
+
+@runtime_checkable
+class CaseStore(Protocol):
+    """Persistence for cases. Deliberately narrow.
+
+    There is no delete: an assessment that informed a decision about a person
+    should remain auditable, and retention belongs to policy rather than to
+    whatever code happens to hold a reference.
+    """
+
+    async def save(self, case_id: str, payload: dict) -> None:
+        ...
+
+    async def load(self, case_id: str) -> dict | None:
+        ...
+
+    async def list_ids(self) -> list[str]:
+        ...
