@@ -45,6 +45,12 @@ SOURCE_TYPES = (
 RENDER_SCALE = 1.7
 MODEL = "claude-sonnet-5"
 
+# A dense page of Hebrew runs long once transcribed verbatim. Too low a
+# ceiling truncates the reply mid-JSON, which parses as nothing and marks
+# the page unreadable -- so a page would fail precisely because it carried
+# the most content.
+MAX_TRANSCRIPTION_TOKENS = 16000
+
 
 class IngestionError(Exception):
     """Raised only for conditions the caller must act on, never for bad input.
@@ -308,6 +314,21 @@ def infer_source_type(name: str) -> str:
     return classify_source("", name)
 
 
+def describe_failures(failed: Sequence[PageText], total: int) -> str:
+    """Say why each page failed, not merely that it did.
+
+    The reason was being computed and thrown away, which left no way to tell
+    a genuinely illegible scan from a reply that was cut off or malformed.
+    Those call for opposite responses -- rescan the document, or fix the
+    request -- and without the reason recorded, both look like bad paper.
+    """
+    parts = []
+    for page in failed:
+        reason = page.notes or f"קריאוּת {page.readable_ratio:.0%}"
+        parts.append(f"עמ' {page.number}: {reason}")
+    return f"{len(failed)} מתוך {total} עמודים · " + " · ".join(parts)
+
+
 def unreadable_source(
     label: str, origin_name: str, path: Path, note: str
 ) -> SourceDocument:
@@ -344,7 +365,7 @@ class Ingestor:
         data = base64.standard_b64encode(image_path.read_bytes()).decode()
         response = await self.client.messages.create(
             model=self.model,
-            max_tokens=8192,
+            max_tokens=MAX_TRANSCRIPTION_TOKENS,
             messages=[
                 {
                     "role": "user",
@@ -364,12 +385,25 @@ class Ingestor:
         )
         number = int(image_path.stem.rsplit("_p", 1)[-1])
         raw = response_text(response)
+        truncated = getattr(response, "stop_reason", None) == "max_tokens"
+
         if not raw:
             # No text block at all. Treated as an unread page rather than an
             # error, so one odd response does not abandon the other pages.
             return PageText(number=number, text="", readable_ratio=0.0,
                             notes="המודל לא החזיר טקסט")
+
         text, ratio, notes = parse_transcription(raw)
+
+        # Truncation has to be named. A cut-off reply parses as nothing and
+        # would otherwise be filed as an illegible page, sending someone to
+        # re-scan a document that scanned perfectly well.
+        if truncated:
+            notes = (
+                f"התשובה נחתכה בגבול {MAX_TRANSCRIPTION_TOKENS} טוקנים — "
+                f"העמוד צפוף מדי, לא בלתי-קריא"
+                + (f" · {notes}" if notes else "")
+            )
         return PageText(number=number, text=text, readable_ratio=ratio, notes=notes)
 
     async def ingest_file(self, path: Path, name: Optional[str] = None) -> List[SourceDocument]:
@@ -452,8 +486,9 @@ class Ingestor:
         if failed:
             numbers = ", ".join(str(p.number) for p in failed)
             label = f"{name} — עמודים שלא נקראו ({numbers})" if readable else name
-            note = f"עמודים {numbers} מתוך {len(pages)}"
-            docs.append(unreadable_source(label, name, path, note))
+            docs.append(
+                unreadable_source(label, name, path, describe_failures(failed, len(pages)))
+            )
 
         return docs or [unreadable_source(name, name, path, "no pages")]
 

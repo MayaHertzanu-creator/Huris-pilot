@@ -244,7 +244,15 @@ async def run() -> None:
         for src in sources:
             lines.append(f"\n## {src.name}")
             lines.append(f"*סוג: {src.source_type} · קריאוּת: {src.legibility.value}*\n")
-            lines.append(src.text if src.text else "_לא ניתן היה לקרוא_")
+            if src.text:
+                lines.append(src.text)
+            else:
+                lines.append("_לא ניתן היה לקרוא_\n")
+                # הסיבה נשמרת ב-original_ref. בלעדיה אי אפשר להבדיל בין
+                # סריקה גרועה לבין תקלה בבקשה, והתגובה הנכונה שונה לגמרי.
+                detail = (src.original_ref or "").split(" · ", 1)
+                if len(detail) > 1:
+                    lines.append(f"**סיבה:** {detail[1]}")
         transcript = OUT / f"{case.name} — תמלול.md"
         transcript.write_text("\n".join(lines), encoding="utf-8")
 
