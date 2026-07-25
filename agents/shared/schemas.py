@@ -118,15 +118,38 @@ class Sign(BaseModel):
     source_name: str
 
 
-class SourceRecord(BaseModel):
-    """One document in the case file, and how readable it was.
+class SourceDocument(BaseModel):
+    """One document in the case file: what it is, how readable, and its text.
 
-    INTERFACES 4c: legibility is metadata about the source, never grounds for
-    a conclusion. A low-legibility source yields Unknown, not False.
+    Name, legibility and content are deliberately kept together. Splitting an
+    inventory from a single concatenated blob would let Agent C know that some
+    source was illegible without knowing which passage came from it -- and it
+    cannot attribute a quote it cannot locate.
+
+    INTERFACES 4c: legibility describes the source, never the subject. A
+    low-legibility source yields Unknown, never False.
     """
 
     name: str
     legibility: Legibility
+    kind: Optional[str] = Field(
+        default=None,
+        description="CV, commander evaluation, psychometric, opinion, ... (RuleBook A D-9)",
+    )
+    text: str = ""
+
+    @model_validator(mode="after")
+    def _check_legible_has_text(self) -> "SourceDocument":
+        if self.legibility is not Legibility.LOW and not self.text.strip():
+            raise ValueError(
+                f"{self.name!r}: marked {self.legibility.value} legibility but "
+                f"carries no text. An empty source is low legibility."
+            )
+        return self
+
+
+# Retained so existing spec references to "source inventory" keep resolving.
+SourceRecord = SourceDocument
 
 
 class Tag(BaseModel):
@@ -223,12 +246,17 @@ class AgentAToBPayload(BaseModel):
 
 
 class AgentAToCPayload(BaseModel):
-    """What Agent C receives: the full picture, evidence included."""
+    """What Agent C receives: everything Agent A saw, plus what it concluded.
+
+    Far richer than the Agent B payload by design. INTERFACES 4 makes Agent C
+    the only integrator, so it needs the sources themselves and not merely the
+    verdicts -- it re-reads them to derive its own constructs (decision 1) and
+    to judge whether Agent A's reading holds up.
+    """
 
     subject_id: str
-    raw_case_text: str
+    sources: List[SourceDocument]
     tags: List[Tag]
-    source_inventory: List[SourceRecord]
 
     @model_validator(mode="after")
     def _check_complete(self) -> "AgentAToCPayload":
@@ -236,16 +264,54 @@ class AgentAToCPayload(BaseModel):
         missing = set(AGENT_A_TAGS) - seen
         if missing:
             raise ValueError(f"Agent C needs all seven tags, missing: {sorted(missing)}")
+
+        known = {s.name for s in self.sources}
+        for tag in self.tags:
+            for sign in tag.signs_found:
+                if sign.source_name not in known:
+                    raise ValueError(
+                        f"{tag.name}: sign cites source {sign.source_name!r}, "
+                        f"which is not in the inventory. Every quote must be "
+                        f"traceable to a source Agent C can open."
+                    )
         return self
+
+    @property
+    def legible_sources(self) -> List[SourceDocument]:
+        return [s for s in self.sources if s.legibility is not Legibility.LOW]
 
     @property
     def has_legible_source(self) -> bool:
         """False when every source was too degraded to read.
 
-        Drives Agent C's unassessable colour rather than a green one, which is
-        the difference between "nothing found" and "nothing readable".
+        Drives Agent C towards unassessable rather than green -- the
+        difference between "nothing found" and "nothing readable".
         """
-        return any(s.legibility is not Legibility.LOW for s in self.source_inventory)
+        return bool(self.legible_sources)
+
+    def raw_case_text(self, legible_only: bool = True) -> str:
+        """The case file as continuous text, with source headers retained.
+
+        Headers are kept so a passage stays attributable after concatenation;
+        Agent C needs to name a source when it quotes one.
+        """
+        docs = self.legible_sources if legible_only else self.sources
+        return "\n\n".join(f"### {d.name}\n{d.text}" for d in docs)
+
+    def coverage_summary(self) -> "CoverageSummary":
+        """Coverage as Agent C should report it, derived from the tags.
+
+        Computed here rather than restated downstream so the audit counts and
+        the tag values cannot disagree.
+        """
+        return CoverageSummary(
+            axes_checked=len(self.tags),
+            axes_negative=sum(1 for t in self.tags if t.value is TagValue.FALSE),
+            axes_unknown=[t.name for t in self.tags if t.value is TagValue.UNKNOWN],
+            unreadable_sources=[
+                s.name for s in self.sources if s.legibility is Legibility.LOW
+            ],
+        )
 
 
 # ---------------------------------------------------------------------------

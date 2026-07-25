@@ -34,6 +34,7 @@ from .schemas import (
     Recommendation,
     RelationType,
     Sign,
+    SourceDocument,
     SourceRecord,
     StatisticalInfluence,
     Strength,
@@ -52,6 +53,7 @@ __all__ = [
     "effective_weight",
     # agent A
     "Sign",
+    "SourceDocument",
     "SourceRecord",
     "Tag",
     "TagValue",
