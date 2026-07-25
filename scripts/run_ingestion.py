@@ -184,6 +184,7 @@ async def run() -> None:
     sys.path.insert(0, str(REPO))
     try:
         from agents.agent_1 import Ingestor, build_payload, explain, inventory
+        from agents.agent_1.extractor import SignExtractor
     except ImportError as exc:
         sys.exit(
             f"\nלא נמצא קוד הפרויקט ב:\n  {REPO}\n\n"
@@ -206,10 +207,24 @@ async def run() -> None:
     if not cases:
         sys.exit("לא נמצאו תיקי נבדקים.")
 
-    pending = [c for c in cases if not (OUT / f"{c.name} — תמלול.md").exists()]
-    done = len(cases) - len(pending)
-    if done:
-        say(f"{done} תיקים כבר נקלטו — מדלג עליהם.")
+    # --רק <שם> מריץ תיק יחיד ומתעלם מכך שהוא כבר נקלט. התמלול עצמו בא
+    # מהמטמון, כך שהרצה חוזרת עולה רק את חילוץ הסימנים.
+    only = None
+    for i, arg in enumerate(sys.argv):
+        if arg in ("--רק", "--only") and i + 1 < len(sys.argv):
+            only = sys.argv[i + 1]
+
+    if only:
+        pending = [c for c in cases if only in c.name]
+        if not pending:
+            sys.exit(f"לא נמצא תיק בשם {only!r}. קיימים: "
+                     + ", ".join(c.name for c in cases))
+        say(f"מריץ מחדש: {pending[0].name}")
+    else:
+        pending = [c for c in cases if not (OUT / f"{c.name} — תמלול.md").exists()]
+        done = len(cases) - len(pending)
+        if done:
+            say(f"{done} תיקים כבר נקלטו — מדלג עליהם.")
     if not pending:
         say(f"\nהכול כבר נקלט. התוצאות ב:\n  {OUT}")
         return
@@ -257,14 +272,26 @@ async def run() -> None:
         transcript.write_text("\n".join(lines), encoding="utf-8")
 
         if any(s.usable for s in sources):
-            payload = build_payload(case.name, [], sources)
+            say("   מחלץ סימנים...")
+            try:
+                signs = await SignExtractor(client=client, model=MODEL).extract_signs(
+                    [s for s in sources if s.usable]
+                )
+            except Exception as exc:
+                say(f"   חילוץ הסימנים נכשל: {exc}")
+                signs = []
+
+            payload = build_payload(case.name, signs, sources)
             tags = [f"# {case.name} — תגיות\n"]
-            tags.append("> הופק ללא שכבת חילוץ הסימנים — כל התגיות שליליות.")
-            tags.append("> משמש לאימות הצינור בלבד.\n")
+            if not signs:
+                tags.append("> לא נמצאו סימנים. אם זה מפתיע — בדקי את התמלול.\n")
             for tag in payload.tags:
                 tags.append(explain(tag) + "\n")
             tags.append("\n" + payload.coverage_summary().audit_line())
             (OUT / f"{case.name} — תגיות.md").write_text("\n".join(tags), encoding="utf-8")
+
+            positive = [t.construct for t in payload.tags if t.value.value == "True"]
+            say(f"   סימנים: {len(signs)} · תגיות חיוביות: {', '.join(positive) or 'אין'}")
 
         if ask:
             if not open_in_editor(transcript):
