@@ -132,20 +132,39 @@ class SourceDocument(BaseModel):
 
     name: str
     legibility: Legibility
-    kind: Optional[str] = Field(
-        default=None,
-        description="CV, commander evaluation, psychometric, opinion, ... (RuleBook A D-9)",
+    source_type: str = Field(
+        default="other",
+        description="cv | screening_test | recruitment_interview | "
+        "occupational_psych_opinion | other (IngestionSpec 6)",
+    )
+    processed: bool = Field(
+        default=True,
+        description="False when nothing usable could be extracted. Such a "
+        "source is counted as a recoverable gap, not passed on.",
     )
     text: str = ""
+    original_ref: Optional[str] = Field(
+        default=None, description="Path or id of the file this came from"
+    )
 
     @model_validator(mode="after")
-    def _check_legible_has_text(self) -> "SourceDocument":
+    def _check_legibility_matches_text(self) -> "SourceDocument":
         if self.legibility is not Legibility.LOW and not self.text.strip():
             raise ValueError(
                 f"{self.name!r}: marked {self.legibility.value} legibility but "
                 f"carries no text. An empty source is low legibility."
             )
+        if not self.processed and self.legibility is not Legibility.LOW:
+            raise ValueError(
+                f"{self.name!r}: processed=False must go with low legibility "
+                f"(IngestionSpec 5)."
+            )
         return self
+
+    @property
+    def usable(self) -> bool:
+        """Whether this source may inform a False, as opposed to an Unknown."""
+        return self.processed and self.legibility is not Legibility.LOW
 
 
 # Retained so existing spec references to "source inventory" keep resolving.

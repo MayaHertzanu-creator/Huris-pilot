@@ -20,6 +20,7 @@ from .decision import (
     explain,
     has_coverage,
 )
+from .ingestion import Ingestor, PageText, detect_format, grade_document, inventory
 from .markers import BY_CONSTRUCT, BY_ID, MARKERS, Marker, markers_for
 
 __all__ = [
@@ -35,4 +36,9 @@ __all__ = [
     "explain",
     "coverage_report",
     "UnknownMarkerError",
+    "Ingestor",
+    "PageText",
+    "detect_format",
+    "grade_document",
+    "inventory",
 ]
