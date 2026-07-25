@@ -14,6 +14,7 @@ import json
 from typing import List, Optional, Sequence
 
 from ..shared.schemas import Legibility, Sign, SourceDocument
+from .ingestion import response_text
 from .markers import BY_ID, MARKERS
 
 MODEL = "claude-sonnet-5"
@@ -148,7 +149,7 @@ class SignExtractor:
             max_tokens=MAX_TOKENS,
             messages=[{"role": "user", "content": build_prompt(source)}],
         )
-        return parse_response(response.content[0].text, source)
+        return parse_response(response_text(response), source)
 
     async def extract_signs(self, sources: Sequence[SourceDocument]) -> List[Sign]:
         """Read every legible source and pool the signs.

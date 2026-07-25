@@ -175,6 +175,26 @@ JSON בלבד:
 {{"text": "התמלול המלא", "readable_ratio": 0.0, "notes": "מה הפריע לקריאה"}}"""
 
 
+def response_text(response) -> str:
+    """Pull the answer out of a model response, ignoring other block types.
+
+    A response is a list of blocks, and the text is not always first: models
+    that reason before answering put a thinking block ahead of it, and tool
+    or citation blocks can appear too. Indexing content[0] happens to work
+    until the day it does not, and then it fails on every page at once.
+
+    Blocks are joined rather than taking the first, since a long answer can
+    be split across several.
+    """
+    blocks = getattr(response, "content", None) or []
+    parts = [
+        block.text
+        for block in blocks
+        if getattr(block, "type", None) == "text" and getattr(block, "text", None)
+    ]
+    return "\n".join(parts).strip()
+
+
 def parse_transcription(raw: str) -> Tuple[str, float, str]:
     """Read the model's transcription response.
 
@@ -296,8 +316,14 @@ class Ingestor:
                 }
             ],
         )
-        text, ratio, notes = parse_transcription(response.content[0].text)
         number = int(image_path.stem.rsplit("_p", 1)[-1])
+        raw = response_text(response)
+        if not raw:
+            # No text block at all. Treated as an unread page rather than an
+            # error, so one odd response does not abandon the other pages.
+            return PageText(number=number, text="", readable_ratio=0.0,
+                            notes="המודל לא החזיר טקסט")
+        text, ratio, notes = parse_transcription(raw)
         return PageText(number=number, text=text, readable_ratio=ratio, notes=notes)
 
     async def ingest_file(self, path: Path, name: Optional[str] = None) -> SourceDocument:
